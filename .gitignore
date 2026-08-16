@@ -1,0 +1,20 @@
+# Python 构建产物
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# 虚拟环境
+.venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 压缩产物（示例与基准测试输出）
+*.tc
+
+# 基准测试缓存（enwik8 语料与结果）
+.benchmarks/

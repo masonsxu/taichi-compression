@@ -1,0 +1,3 @@
+TaiChi Compression is a lossless text compression tool that pairs a large language model with arithmetic coding. The language model reads the context and predicts the probability of the next token; the arithmetic coder turns those probabilities into bits. When the model is confident, a token costs a fraction of a bit; when it is surprised, the token costs more. Compression and decompression share exactly the same model, the same tokenizer, and the same call sequence, so every prediction matches bit for bit and the original text comes back perfectly.
+
+太极生两仪：预测为阴，编码为阳。阴阳相济，熵尽其用。
