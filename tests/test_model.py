@@ -18,8 +18,9 @@ try:
     from taichi_compress.model import (
         LLMPredictor,
         PredictorConfig,
+        create_predictor,
         quantized_softmax,
-        resolve_dtype,
+        resolve_quant,
     )
     HAVE_LLM = True
 except ImportError:  # pragma: no cover
@@ -67,24 +68,43 @@ class TestQuantizedSoftmax(unittest.TestCase):
             quantized_softmax(np.array([1.0]), scale=-1)
 
 
-class TestResolveDtype(unittest.TestCase):
-    """权重精度解析（纯逻辑，不需要模型权重）。"""
+class TestResolveQuant(unittest.TestCase):
+    """权重量化类型解析（纯逻辑，不需要模型权重）。"""
 
     def test_auto_by_device(self):
-        self.assertEqual(resolve_dtype(None, "cpu"), "float32")
-        self.assertEqual(resolve_dtype(None, "mps"), "float16")
-        self.assertEqual(resolve_dtype(None, "cuda"), "float16")
-        self.assertEqual(resolve_dtype(None, torch.device("cuda:0")), "float16")
+        self.assertEqual(resolve_quant(None, "cpu"), "float32")
+        self.assertEqual(resolve_quant(None, "mps"), "float16")
+        self.assertEqual(resolve_quant(None, "cuda"), "float16")
+        self.assertEqual(resolve_quant(None, torch.device("cuda:0")), "float16")
 
     def test_explicit_overrides_auto(self):
-        self.assertEqual(resolve_dtype("float16", "cpu"), "float16")
-        self.assertEqual(resolve_dtype("float32", "mps"), "float32")
+        self.assertEqual(resolve_quant("float16", "cpu"), "float16")
+        self.assertEqual(resolve_quant("float32", "mps"), "float32")
+        self.assertEqual(resolve_quant("q8_0", "cpu"), "q8_0")
 
     def test_invalid_raises(self):
-        for bad in ("fp16", "half", "bfloat16", ""):
-            with self.subTest(dtype=bad):
+        for bad in ("fp16", "half", "bfloat16", "int8", ""):
+            with self.subTest(quant=bad):
                 with self.assertRaises(ValueError):
-                    resolve_dtype(bad, "cpu")
+                    resolve_quant(bad, "cpu")
+
+
+@unittest.skipUnless(HAVE_LLM, "需要 torch/transformers")
+class TestCreatePredictorRouting(unittest.TestCase):
+    """工厂路由（纯逻辑：不实际加载模型，只验证参数校验与后端推断）。"""
+
+    def test_unknown_override_raises(self):
+        with self.assertRaises(TypeError):
+            create_predictor(PredictorConfig(), dtype="float16")  # type: ignore[arg-type]
+
+    def test_unknown_backend_raises(self):
+        with self.assertRaises(ValueError):
+            create_predictor(PredictorConfig(backend="onnx"))
+
+    def test_quant_requires_gguf_backend(self):
+        # transformers 后端显式拒绝量化类型，指引用户走工厂/GGUF 预测器
+        with self.assertRaises(ValueError):
+            LLMPredictor(PredictorConfig(quant="q8_0", device="cpu"))
 
 
 @unittest.skipUnless(HAVE_LLM, "需要 torch/transformers")
@@ -103,10 +123,11 @@ class TestLLMPredictor(unittest.TestCase):
     def setUp(self):
         self.predictor.reset()
 
-    def test_default_dtype_follows_device(self):
+    def test_default_quant_follows_device(self):
         # 权重精度自动策略：CPU 用 float32，加速器（mps/cuda）用 float16
         expected = "float32" if self.predictor.device == "cpu" else "float16"
-        self.assertEqual(self.predictor.dtype_name, expected)
+        self.assertEqual(self.predictor.quant_name, expected)
+        self.assertEqual(self.predictor.backend, "transformers")
         self.assertEqual(self.predictor._model.dtype, getattr(torch, expected))
 
     def test_distribution_shape_and_normalized(self):
@@ -137,7 +158,7 @@ class TestLLMPredictor(unittest.TestCase):
         的 ulp 更粗（logit 量级 ~10 时约 0.01），不同前向形状的差异相应放大，
         容差按精度放宽。
         """
-        atol = 1e-3 if self.predictor.dtype_name == "float32" else 5e-2
+        atol = 1e-3 if self.predictor.quant_name == "float32" else 5e-2
         incremental = []
         for i in range(1, len(self.tokens) + 1):
             incremental.append(self.predictor.predict_next_token_probabilities(self.tokens[:i]))

@@ -26,6 +26,7 @@ taichi-compression/
 │   ├── arithmetic.py       # ✅ 算术编码器核心（WNC 整数算术编码，32 位寄存器 / 24 位 CDF）
 │   ├── utils.py            # ✅ 比特级 IO（BitWriter/BitReader）与 varint
 │   ├── model.py            # ✅ LLM 预测器（KV Cache 增量推理 + logit 量化，任务 2）
+│   ├── gguf.py             # ✅ llama.cpp/GGUF 量化后端（q8_0 / q4_k_m，Phase 3B）
 │   ├── tokenizer.py        # ✅ 分词与 token 管理（任务 2）
 │   ├── compressor.py       # ✅ 压缩主流程 + TAICHI 容器格式（任务 3）
 │   ├── decompressor.py     # ✅ 解压主流程 + CRC32 完整性校验（任务 4）
@@ -94,7 +95,9 @@ TAICHI_TEST_DEVICE=mps uv run pytest tests/test_model.py
 
 | 算法 | 压缩比 | bpb | 压缩速度 | 解压速度 |
 |------|-------:|--------:|---------:|---------:|
-| **taichi (fp16)** | **8.45x** | **0.947** | 147 B/s | 148 B/s |
+| **taichi (GGUF q8_0)** | **8.44x** | **0.948** | **395 B/s** | **396 B/s** |
+| taichi (GGUF q4_k_m) | 8.37x | 0.956 | 446 B/s | 446 B/s |
+| taichi (fp16) | 8.45x | 0.947 | 147 B/s | 148 B/s |
 | taichi (fp32 基线) | 8.46x | 0.946 | 50 B/s | 48 B/s |
 | gzip -9 | 2.25x | 3.560 | 55 MB/s | 413 MB/s |
 | xz -9 | 2.27x | 3.520 | 4.0 MB/s | 55 MB/s |
@@ -103,26 +106,56 @@ TAICHI_TEST_DEVICE=mps uv run pytest tests/test_model.py
 - 采样：enwik8（99.6M 字符）全文等分 8 段各取开头 8192 字符（64 KB，占语料 0.07%），
   各算法逐块独立压缩-解压并逐字节校验；峰值内存 2822 MiB（float32 基线 3772 MiB）
 - 复现：`uv run python scripts/benchmark_enwik8.py`（默认 auto → MPS float16，
-  约 15 分钟；`--dtype float32` 复现基线约 40 分钟；支持 `--blocks/--block-chars/--model/--device`）
+  约 15 分钟；`--quant q8_0` 约 5 分钟；`--quant float32` 复现基线约 40 分钟；
+  支持 `--blocks/--block-chars/--model/--device`）
 - 逐块 bpb 区间 0.721 ~ 1.080：纯英文段落低至 0.72，多语言/重标记块偏高
-- ✅ **Phase 2 优化：FP16 权重推理**（容器 v2 记录 dtype）
-  - 权重精度可配置（`--dtype auto|float32|float16`，auto = 加速器用 float16、
+- ✅ **Phase 2 优化：FP16 权重推理**（容器 v2 记录量化类型）
+  - 权重精度可配置（`--quant auto|float32|float16`，auto = 加速器用 float16、
     CPU 用 float32）；fp16 权重带宽减半，实测压缩/解压提速 **~2.8x**
     （50 → 147 B/s），峰值内存 3772 → **2822 MiB**，bpb 仅 +0.001
-  - 容器 v2 在 v1 基础上新增 dtype 字段；float32 输出与 v1 历史文件
+  - 容器 v2 在 v1 基础上新增量化类型字段；float32 输出与 v1 历史文件
     **逐字节兼容**，旧文件可正常解压
   - 一致性边界：fp16 仅保证**同设备**逐比特一致（对称调用序列 + 确定性内核），
     跨设备解压会被 CRC32 拒绝而非解出错误数据；跨设备需求请用 float32 压缩
+- ✅ **Phase 3B 优化：llama.cpp / GGUF 量化后端**（`gguf.py`，容器 v3 记录后端+量化）
+  - 权重级量化推理（`--quant q8_0 / q4_k_m`）：llama-cpp-python 进程内推理 +
+    Metal 加速，duck-type `LLMPredictor` 接口，压缩/解压主流程零改动复用
+  - 实测 enwik8（q8_0）：压缩/解压 **395/396 B/s**（较 fp16 再提速 **2.7x**，
+    较 fp32 基线 **~8x**），峰值内存 **1923 MiB**（fp16 2822），bpb 仅 +0.002；
+    q4_k_m 更快更省：**446 B/s**、峰值 **1799 MiB**，bpb +0.010（体积仍为
+    gzip -9 的 27%）；权重文件 q8_0 506 MB / q4_k_m 379 MB（fp16 权重内存约 0.94 GB）
+  - 无损协议：HF tokenizer 与 llama.cpp 分词**逐 id 一致**（已验证）；
+    加载后对称预热丢弃首次计算图构建结果，此后逐比特确定；容器头记录
+    后端+量化类型，解压侧同文件同构建还原，不一致时 CRC32 拒绝
+  - `create_predictor()` 统一工厂路由：quant 决定 transformers / llama 后端
 
 ## 命令行用法（任务 5）
 
 ```bash
 taichi-compress -c input.txt -o output.tc       # 压缩（加速器默认 fp16）
-taichi-compress -d output.tc -o restored.txt    # 解压（CRC32 校验，dtype 以容器头为准）
+taichi-compress -d output.tc -o restored.txt    # 解压（CRC32 校验，配置以容器头为准）
 taichi-compress --benchmark input.txt           # 与 gzip/xz/zstd 对比
 taichi-compress --info output.tc                # 查看容器头（不加载模型）
 taichi-compress -c big.txt --device mps --model Qwen/Qwen2.5-0.5B
-taichi-compress -c doc.txt --dtype float32      # 需要跨设备解压时用 float32
+taichi-compress -c doc.txt --quant float32      # 需要跨设备解压时用 float32
+```
+
+### GGUF 量化后端（Phase 3B）
+
+```bash
+uv sync --extra llama                          # 安装 llama-cpp-python（macOS wheel 自带 Metal）
+taichi-compress -c input.txt --quant q8_0      # 权重级量化推理（也可 q4_k_m）
+taichi-compress -d output.tc                   # 解压按容器头自动路由到 GGUF 后端
+```
+
+GGUF 文件按 `{模型名小写}-{quant}.gguf` 约定搜索：`$TAICHI_GGUF_DIR` →
+`./.gguf` → `~/.cache/taichi`，也可用 `--gguf FILE` 显式指定。Qwen2.5 官方
+repo 提供 `GGUF` 分支的现成量化；如需自行转换（base 模型无官方 GGUF 时）：
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+python llama.cpp/convert_hf_to_gguf.py ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B \
+    --outfile .gguf/qwen2.5-0.5b-q8_0.gguf --outtype q8_0   # 或 q4_k_m
 ```
 
 ## 便捷 API 示例
@@ -140,14 +173,17 @@ assert decode(data, probs) == symbols
 ## 文件压缩示例（任务 3/4）
 
 ```python
-from taichi_compress.model import LLMPredictor
+from taichi_compress.model import PredictorConfig, create_predictor
 from taichi_compress.compressor import compress_file
 from taichi_compress.decompressor import decompress_file
 
-predictor = LLMPredictor()  # Qwen2.5-0.5B，自动选择设备（cuda > mps > cpu）
+predictor = create_predictor()  # Qwen2.5-0.5B，自动选择设备（cuda > mps > cpu）
 stats = compress_file("input.txt", "input.tc", predictor)
 print(f"压缩比 {stats.ratio:.2f}x，{stats.bits_per_byte:.3f} bpb")
 decompress_file("input.tc", "input.restored.txt", predictor)  # CRC32 校验通过
+
+# GGUF 量化后端：quant 决定路由（q8_0 / q4_k_m → llama.cpp）
+gguf_predictor = create_predictor(PredictorConfig(quant="q8_0"))
 ```
 
 ## 参考

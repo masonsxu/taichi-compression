@@ -18,3 +18,6 @@ htmlcov/
 
 # 基准测试缓存（enwik8 语料与结果）
 .benchmarks/
+
+# GGUF 量化权重（数百 MB，按 README 配方自行转换/下载）
+.gguf/

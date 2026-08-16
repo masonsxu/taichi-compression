@@ -73,8 +73,8 @@ class TestCliBasics(unittest.TestCase):
             self.assertIn("24", out)
             self.assertIn("00000000", out)
 
-    def test_info_prints_v2_dtype(self):
-        # float16 容器（v2）应显示权重精度与版本号；float32 头保持 v1 布局
+    def test_info_prints_quant_and_version(self):
+        # float16 容器（v2）应显示量化类型与版本号；float32 头保持 v1 布局
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fp16.tc"
             path.write_bytes(
@@ -85,7 +85,7 @@ class TestCliBasics(unittest.TestCase):
                     num_tokens=0,
                     model_id="Qwen/Qwen2.5-0.5B",
                     crc32=0,
-                    dtype="float16",
+                    quant="float16",
                 ).to_bytes()
             )
             code, out, err = run_cli("--info", str(path))
@@ -99,9 +99,31 @@ class TestCliBasics(unittest.TestCase):
                 num_tokens=0,
                 model_id="Qwen/Qwen2.5-0.5B",
                 crc32=0,
-                dtype="float32",
+                quant="float32",
             ).to_bytes()
             self.assertEqual(v1[6], 1)  # float32 输出版本字节 = 1（历史兼容）
+
+    def test_info_prints_v3_gguf_header(self):
+        # llama.cpp/GGUF 后端写 v3 容器：含量化类型与后端字段
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "q8.tc"
+            path.write_bytes(
+                ContainerHeader(
+                    precision=24,
+                    logit_scale=1000,
+                    original_size=0,
+                    num_tokens=0,
+                    model_id="Qwen/Qwen2.5-0.5B",
+                    crc32=0,
+                    quant="q8_0",
+                    backend="llama",
+                ).to_bytes()
+            )
+            code, out, err = run_cli("--info", str(path))
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("q8_0", out)
+            self.assertIn("llama", out)
+            self.assertIn("v3", out)
 
     def test_missing_input_returns_error(self):
         code, _, err = run_cli("-c", "/nonexistent/x.txt", "-o", "/tmp/should_not_exist.tc")

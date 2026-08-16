@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .arithmetic import ArithmeticDecoder, build_cdf
 from .compressor import ContainerHeader, check_context_limit, parse_header
-from .model import LLMPredictor, PredictorConfig
+from .model import LLMPredictor, PredictorConfig, create_predictor
 from .utils import BitReader
 
 __all__ = ["DecompressionStats", "decompress_text", "decompress_file"]
@@ -50,9 +50,10 @@ def decompress_text(
 ) -> str:
     """解压容器字节串，返回还原文本。
 
-    模型标识与权重精度以容器头为准：未提供 predictor 时按头部
-    model_id / logit_scale / dtype 加载；提供时校验其与头部一致（防止
-    拿错配置解出静默错误的数据，CRC32 兜底校验最终仍会拦截）。
+    模型标识、量化类型与推理后端以容器头为准：未提供 predictor 时按头部
+    model_id / logit_scale / quant / backend 加载（经 create_predictor 路由）；
+    提供时校验其与头部一致（防止拿错配置解出静默错误的数据，
+    CRC32 兜底校验最终仍会拦截）。
 
     Args:
         data: ``compress_text`` / ``compress_file`` 产生的字节串
@@ -90,12 +91,13 @@ def _decompress(
     """解压主循环：逐 token「LLM 预测 → 算术解码」，镜像压缩侧调用序列。"""
     header, body_start = parse_header(data)
     if predictor is None:
-        predictor = LLMPredictor(
+        predictor = create_predictor(
             PredictorConfig(
                 model_id=header.model_id,
                 device=device,
                 logit_scale=header.logit_scale,
-                dtype=header.dtype,
+                quant=header.quant,
+                backend=header.backend,
             )
         )
     else:
@@ -137,8 +139,10 @@ def _verify_predictor(predictor: LLMPredictor, header: ContainerHeader) -> None:
             f"logit 量化精度不一致：预测器 {predictor.logit_scale}，"
             f"文件头 {header.logit_scale}"
         )
-    if predictor.dtype_name != header.dtype:
+    if predictor.quant_name != header.quant or predictor.backend != header.backend:
         raise ValueError(
-            f"权重精度不一致：预测器 {predictor.dtype_name}，文件头 {header.dtype}"
-            "（float16 文件须在与压缩侧相同的设备上解压，或改用 float32 压缩）"
+            f"量化/后端不一致：预测器 {predictor.backend}/{predictor.quant_name}，"
+            f"文件头 {header.backend}/{header.quant}"
+            "（float16 与量化文件须在与压缩侧相同的环境解压，"
+            "跨设备需求请用 float32 压缩）"
         )

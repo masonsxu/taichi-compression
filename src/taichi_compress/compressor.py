@@ -3,21 +3,24 @@
 流程：读取文本 → tokenizer 分词 → 逐 token 由 LLM 预测概率分布 →
 算术编码 → 输出含容器头的压缩文件。
 
-容器格式（版本 2，逐字节确定）::
+容器格式（版本 3，逐字节确定）::
 
     偏移 0..5    magic = b"TAICHI"
-    偏移 6       格式版本 = 1 或 2
+    偏移 6       格式版本 = 1 / 2 / 3
     偏移 7       CDF 量子精度（1~30 比特）
     varint       logit 量化精度（0 表示不量化）
-    [仅 v2] 1 字节 权重精度代码（0=float32，1=float16）
+    [v2+] 1 字节  权重量化代码（0=float32，1=float16，2=q8_0，3=q4_k_m）
+    [v3] 1 字节   推理后端代码（0=transformers，1=llama.cpp/GGUF）
     varint       原始 UTF-8 字节数
     varint       token 总数
     varint+bytes 模型标识（长度前缀的 UTF-8）
     4 字节       原始字节的 CRC32（解压侧完整性校验）
     其后         算术编码比特流（MSB-first，末尾补 0 对齐字节）
 
-v1 与 v2 的唯一区别是 dtype 字段：float32 压缩写 v1（与历史文件逐字节
-兼容，等价于 v2 + dtype=float32），float16 压缩写 v2。
+版本由内容决定：transformers+float32 写 v1（与历史文件逐字节兼容），
+transformers+float16 写 v2，llama.cpp/GGUF 后端写 v3（带 backend 字节；
+v2 文件隐含 backend=transformers）。量化/后端/模型标识三者共同决定
+解压侧的推理环境，不一致时 CRC32 拒绝。
 
 限制：整文件单段压缩（KV Cache 连续增长），受模型上下文长度约束
 （Qwen2.5-0.5B 为 32768 token）。大文件分块处理属于 Phase 2。
@@ -44,7 +47,8 @@ from .utils import BitWriter, read_varint, write_varint
 __all__ = [
     "MAGIC",
     "CONTAINER_VERSION",
-    "DTYPE_CODES",
+    "QUANT_CODES",
+    "BACKEND_CODES",
     "ContainerHeader",
     "CompressionStats",
     "check_context_limit",
@@ -55,9 +59,11 @@ __all__ = [
 ]
 
 MAGIC = b"TAICHI"
-CONTAINER_VERSION = 2
-DTYPE_CODES = {"float32": 0, "float16": 1}  # v2 头部的权重精度代码
-_CODE_TO_DTYPE = {code: name for name, code in DTYPE_CODES.items()}
+CONTAINER_VERSION = 3
+QUANT_CODES = {"float32": 0, "float16": 1, "q8_0": 2, "q4_k_m": 3}
+BACKEND_CODES = {"transformers": 0, "llama": 1}
+_CODE_TO_QUANT = {code: name for name, code in QUANT_CODES.items()}
+_CODE_TO_BACKEND = {code: name for name, code in BACKEND_CODES.items()}
 _HEADER_FIXED = len(MAGIC) + 2  # magic + version + precision
 
 
@@ -71,25 +77,30 @@ class ContainerHeader:
     num_tokens: int  # token 总数
     model_id: str  # 模型标识（解压侧必须一致）
     crc32: int  # 原始字节的 CRC32
-    dtype: str = "float32"  # 权重精度（v2 字段；float32 输出等价于 v1）
+    quant: str = "float32"  # 权重量化类型（v2+ 字段；float32 输出等价于 v1）
+    backend: str = "transformers"  # 推理后端（v3 字段；v1/v2 隐含 transformers）
     version: int = CONTAINER_VERSION
 
     def to_bytes(self) -> bytes:
         """序列化为容器头字节串（长度可变）。
 
-        版本由 dtype 决定：float32 写 v1（与历史文件逐字节兼容），
-        其他精度写 v2 并附带 dtype 代码。
+        版本由内容决定：transformers+float32 写 v1（与历史文件逐字节兼容），
+        transformers+float16 写 v2，llama 后端（任意量化）写 v3。
         """
-        if self.dtype not in DTYPE_CODES:
-            raise ValueError(f"未知权重精度: {self.dtype!r}，可选 {sorted(DTYPE_CODES)}")
-        version = 1 if self.dtype == "float32" else CONTAINER_VERSION
+        if self.quant not in QUANT_CODES:
+            raise ValueError(f"未知量化类型: {self.quant!r}，可选 {sorted(QUANT_CODES)}")
+        if self.backend not in BACKEND_CODES:
+            raise ValueError(f"未知后端: {self.backend!r}，可选 {sorted(BACKEND_CODES)}")
+        version = _header_version(self.quant, self.backend)
         buf = bytearray()
         buf += MAGIC
         buf.append(version)
         buf.append(self.precision)
         write_varint(buf, self.logit_scale or 0)
         if version >= 2:
-            buf.append(DTYPE_CODES[self.dtype])
+            buf.append(QUANT_CODES[self.quant])
+        if version >= 3:
+            buf.append(BACKEND_CODES[self.backend])
         write_varint(buf, self.original_size)
         write_varint(buf, self.num_tokens)
         model_bytes = self.model_id.encode("utf-8")
@@ -99,6 +110,13 @@ class ContainerHeader:
         return bytes(buf)
 
 
+def _header_version(quant: str, backend: str) -> int:
+    """量化+后端 → 输出容器版本（保持历史版本逐字节兼容）。"""
+    if backend == "llama":
+        return 3
+    return 1 if quant == "float32" else 2
+
+
 def parse_header(data: bytes) -> tuple[ContainerHeader, int]:
     """解析容器头。
 
@@ -106,27 +124,35 @@ def parse_header(data: bytes) -> tuple[ContainerHeader, int]:
         (容器头, 算术比特流起始偏移)
 
     Raises:
-        ValueError: magic / 版本 / 精度 / dtype 代码非法，或文件头被截断
+        ValueError: magic / 版本 / 精度 / 量化或后端代码非法，或文件头被截断
     """
     if len(data) < _HEADER_FIXED + 4 or data[: len(MAGIC)] != MAGIC:
         raise ValueError("不是太极压缩文件（magic 不符或数据过短）")
     version = data[len(MAGIC)]
-    if version not in (1, CONTAINER_VERSION):
+    if version not in (1, 2, CONTAINER_VERSION):
         raise ValueError(f"不支持的容器版本: {version}")
     precision = data[len(MAGIC) + 1]
     if not MIN_PRECISION <= precision <= MAX_PRECISION:
         raise ValueError(f"CDF 精度非法: {precision}")
     pos = _HEADER_FIXED
     scale, pos = read_varint(data, pos)
-    if version == 1:
-        dtype = "float32"  # v1 均为 float32 压缩（等价于 v2 + dtype 代码 0）
-    else:
+    quant = "float32"  # v1 均为 float32（等价于 v2 + 量化代码 0）
+    backend = "transformers"  # v1/v2 隐含 transformers 后端
+    if version >= 2:
         if pos >= len(data):
             raise ValueError("容器头被截断")
         code = data[pos]
-        if code not in _CODE_TO_DTYPE:
-            raise ValueError(f"未知权重精度代码: {code}")
-        dtype = _CODE_TO_DTYPE[code]
+        if code not in _CODE_TO_QUANT:
+            raise ValueError(f"未知权重量化代码: {code}")
+        quant = _CODE_TO_QUANT[code]
+        pos += 1
+    if version >= 3:
+        if pos >= len(data):
+            raise ValueError("容器头被截断")
+        code = data[pos]
+        if code not in _CODE_TO_BACKEND:
+            raise ValueError(f"未知推理后端代码: {code}")
+        backend = _CODE_TO_BACKEND[code]
         pos += 1
     original_size, pos = read_varint(data, pos)
     num_tokens, pos = read_varint(data, pos)
@@ -146,7 +172,8 @@ def parse_header(data: bytes) -> tuple[ContainerHeader, int]:
         num_tokens=num_tokens,
         model_id=model_id,
         crc32=crc,
-        dtype=dtype,
+        quant=quant,
+        backend=backend,
         version=version,
     )
     return header, pos + 4
@@ -269,7 +296,8 @@ def _compress(
         num_tokens=len(tokens),
         model_id=predictor.model_id,
         crc32=zlib.crc32(raw),
-        dtype=predictor.dtype_name,
+        quant=predictor.quant_name,
+        backend=predictor.backend,
     )
     data = header.to_bytes() + writer.to_bytes()
     stats = CompressionStats(

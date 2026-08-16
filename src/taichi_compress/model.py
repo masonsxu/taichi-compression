@@ -13,8 +13,10 @@
    ``float32`` 时跨设备/跨内核差异仅 ~1e-6，量化网格完全吸收，
    **跨设备解压受支持**；``float16`` 时权重带宽减半（约 1.8x 提速、
    权重内存减半），但浮点差异超出网格吸收能力，仅保证**同设备**
-   逐比特一致（对称调用序列 + 确定性内核），跨设备解压会被 CRC32
-   拒绝而非解出错误数据。dtype 随容器头记录，解压侧据此加载；
+   逐比特一致（对称调用序列 + 确定性内核）；``q8_0``/``q4_k_m``
+   走 llama.cpp/GGUF 后端（见 :mod:`taichi_compress.gguf`），速度与
+   内存更优，同样遵循"同环境解压"纪律。非 float32 的解压差异都会被
+   CRC32 拒绝而非解出错误数据；量化类型与推理后端随容器头记录；
 3. **分布覆盖全词表且恒为正**：概率被 CDF 量化为 0 的 token 依然可编码
    （``arithmetic.build_cdf`` 为每个符号保底 1 个量子）。
 
@@ -44,13 +46,14 @@ __all__ = [
     "DEFAULT_MODEL_ID",
     "PredictorConfig",
     "LLMPredictor",
+    "create_predictor",
     "quantized_softmax",
-    "resolve_dtype",
+    "resolve_quant",
 ]
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-0.5B"
 
-_DTYPE_NAMES = ("float32", "float16")
+_QUANT_NAMES = ("float32", "float16", "q8_0", "q4_k_m")
 
 
 @dataclass(frozen=True)
@@ -63,15 +66,20 @@ class PredictorConfig:
         logit_scale: logit 量化精度（量化到 1/scale 的整数格点），
             None 表示不量化（不推荐用于压缩）
         prefill_chunk: 首次填充与长上下文重算时的分块 token 数，控制峰值内存
-        dtype: 权重精度 "float32" / "float16"；None 表示按设备自动选择
-            （cuda/mps 用 float16 换带宽与内存，cpu 用 float32 保兼容）
+        quant: 权重精度/量化类型 "float32" / "float16" / "q8_0" / "q4_k_m"；
+            None 表示按设备自动选择（cuda/mps 用 float16，cpu 用 float32）；
+            q8_0 / q4_k_m 走 llama.cpp/GGUF 后端（见 gguf.py）
+        backend: "transformers" / "llama"；None 按量化类型自动推断
+        gguf_path: llama 后端的 GGUF 文件路径；None 按约定搜索（见 gguf.py）
     """
 
     model_id: str = DEFAULT_MODEL_ID
     device: str | None = None
     logit_scale: int | None = 1000
     prefill_chunk: int = 1024
-    dtype: str | None = None
+    quant: str | None = None
+    backend: str | None = None
+    gguf_path: str | None = None
 
 
 def quantized_softmax(logits: np.ndarray, scale: int | None = 1000) -> np.ndarray:
@@ -107,18 +115,19 @@ def _auto_device() -> str:
     return "cpu"
 
 
-def resolve_dtype(dtype: str | None, device: torch.device | str) -> str:
+def resolve_quant(quant: str | None, device: torch.device | str) -> str:
     """解析权重精度：None 时按设备自动选择（cuda/mps 用 float16，cpu 用 float32）。
 
     float16 只保证同设备逐比特一致（见模块 docstring），因此仅在有加速器时
-    作为默认值；显式指定始终优先于自动选择。
+    作为默认值；显式指定始终优先于自动选择。q8_0/q4_k_m 属于 llama.cpp
+    后端，原样放行（由 create_predictor 路由）。
     """
-    if dtype is None:
+    if quant is None:
         kind = torch.device(device).type
         return "float16" if kind in ("cuda", "mps") else "float32"
-    if dtype not in _DTYPE_NAMES:
-        raise ValueError(f"dtype 必须为 {'/'.join(_DTYPE_NAMES)} 或 None（自动），当前为 {dtype!r}")
-    return dtype
+    if quant not in _QUANT_NAMES:
+        raise ValueError(f"quant 必须为 {'/'.join(_QUANT_NAMES)} 或 None（自动），当前为 {quant!r}")
+    return quant
 
 
 class LLMPredictor:
@@ -144,8 +153,13 @@ class LLMPredictor:
 
         self._config = cfg
         self._device = torch.device(cfg.device if cfg.device else _auto_device())
-        self._dtype_name = resolve_dtype(cfg.dtype, self._device)
-        torch_dtype = getattr(torch, self._dtype_name)
+        self._quant_name = resolve_quant(cfg.quant, self._device)
+        if self._quant_name in ("q8_0", "q4_k_m"):
+            raise ValueError(
+                f"量化 {self._quant_name!r} 需要 llama.cpp/GGUF 后端，"
+                "请使用 create_predictor() 或 GGUFPredictor"
+            )
+        torch_dtype = getattr(torch, self._quant_name)
         self._tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
         try:
             model = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=torch_dtype)
@@ -196,9 +210,14 @@ class LLMPredictor:
         return self._config.logit_scale
 
     @property
-    def dtype_name(self) -> str:
+    def quant_name(self) -> str:
         """权重精度（"float32" / "float16"）；写入容器头，解压侧据此加载。"""
-        return self._dtype_name
+        return self._quant_name
+
+    @property
+    def backend(self) -> str:
+        """推理后端标识（"transformers"）。"""
+        return "transformers"
 
     @property
     def max_context_tokens(self) -> int:
@@ -291,3 +310,39 @@ class LLMPredictor:
         if callable(get_seq_length):
             return int(get_seq_length())
         return int(past[0][0].shape[-2])  # legacy tuple: (k, v) 中 k 的序列维
+
+
+def create_predictor(
+    config: PredictorConfig | None = None, **overrides: Any
+) -> "LLMPredictor | GGUFPredictor":
+    """按配置构建预测器，量化类型决定后端路由。
+
+    - quant ∈ {q8_0, q4_k_m} 或 backend="llama" → :class:`GGUFPredictor`
+      （llama.cpp/GGUF，进程内推理 + 对称预热）
+    - 其余 → :class:`LLMPredictor`（transformers，float32/float16）
+
+    压缩/解压主流程统一经由此工厂构建预测器，容器头的 quant 与 backend
+    字段据此还原。gguf_path 为 None 时按约定搜索（见 gguf.py）。
+    """
+    if config is None:
+        config = PredictorConfig()
+    unknown = set(overrides) - set(config.__dataclass_fields__)
+    if unknown:
+        raise TypeError(f"未知的配置项: {sorted(unknown)}")
+    from dataclasses import replace
+
+    cfg = replace(config, **overrides) if overrides else config
+    quant = resolve_quant(cfg.quant, cfg.device if cfg.device else _auto_device())
+    backend = cfg.backend or ("llama" if quant in ("q8_0", "q4_k_m") else "transformers")
+    if backend == "llama":
+        from .gguf import GGUFPredictor, resolve_gguf_path
+
+        path = resolve_gguf_path(cfg.model_id, quant, cfg.gguf_path)
+        return GGUFPredictor(
+            path,
+            model_id=cfg.model_id,
+            logit_scale=cfg.logit_scale,
+        )
+    if backend != "transformers":
+        raise ValueError(f"未知后端 {backend!r}（可选 transformers / llama）")
+    return LLMPredictor(replace(cfg, quant=quant))
