@@ -146,5 +146,49 @@ class TestRoundtrip(unittest.TestCase):
                 compress_file(bad, Path(tmp) / "out.tc", self.predictor)
 
 
+@unittest.skipUnless(HAVE_LLM, "需要 torch/transformers")
+class TestDtypeRoundtrip(unittest.TestCase):
+    """权重精度（dtype）× 容器版本：float16 走 v2 容器，float32 保持 v1 兼容。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.fp16 = LLMPredictor(
+                PredictorConfig(model_id=MODEL_ID, device=DEVICE, dtype="float16")
+            )
+            cls.fp32 = LLMPredictor(
+                PredictorConfig(model_id=MODEL_ID, device=DEVICE, dtype="float32")
+            )
+        except Exception as exc:  # pragma: no cover - 网络不可用/权重下载失败
+            raise unittest.SkipTest(f"模型加载失败: {exc}") from exc
+
+    def test_float16_writes_v2_and_roundtrips(self):
+        data = compress_text("Hello World 太极 fp16", self.fp16)
+        header, _ = parse_header(data)
+        self.assertEqual(header.version, 2)
+        self.assertEqual(header.dtype, "float16")
+        self.assertEqual(decompress_text(data, self.fp16), "Hello World 太极 fp16")
+
+    def test_float32_keeps_v1_layout(self):
+        # float32 输出与历史 v1 文件逐字节同构（dtype 字段不出现）
+        data = compress_text("Hello World", self.fp32)
+        header, _ = parse_header(data)
+        self.assertEqual((header.version, header.dtype), (1, "float32"))
+        self.assertEqual(decompress_text(data, self.fp32), "Hello World")
+
+    def test_decompress_self_constructs_fp16_predictor(self):
+        # 不传 predictor：按容器头 dtype 自动加载（解压侧契约）。
+        # 设备须显式固定为压缩侧同一设备：fp16 仅保证同设备逐比特一致，
+        # auto 设备选择在多设备机器上可能选到另一台设备（如 cpu 压缩、
+        # mps 解压），那是 CRC 拒绝的场景而非 bug。
+        data = compress_text("Hello World", self.fp16)
+        self.assertEqual(decompress_text(data, device=self.fp16.device), "Hello World")
+
+    def test_dtype_mismatch_raises(self):
+        data = compress_text("Hello World", self.fp16)
+        with self.assertRaises(ValueError):
+            decompress_text(data, self.fp32)
+
+
 if __name__ == "__main__":
     unittest.main()

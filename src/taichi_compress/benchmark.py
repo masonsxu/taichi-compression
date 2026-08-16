@@ -103,21 +103,24 @@ def benchmark_taichi(
     *,
     model_id: str | None = None,
     device: str | None = None,
+    dtype: str | None = None,
     precision: int = DEFAULT_PRECISION,
 ) -> AlgorithmResult:
     """太极压缩基准：压缩 + 解压 + 往返校验（计时不含模型加载）。
 
     Args:
         text: 待压缩文本
-        predictor: 已加载的 LLMPredictor；None 时按 model_id / device 现场加载
-        model_id / device: 仅在 predictor 为 None 时生效
+        predictor: 已加载的 LLMPredictor；None 时按 model_id / device / dtype 现场加载
+        model_id / device / dtype: 仅在 predictor 为 None 时生效
         precision: CDF 量子精度
     """
     from .model import DEFAULT_MODEL_ID, LLMPredictor, PredictorConfig  # 延迟导入：本模块其余功能不依赖 torch
 
     if predictor is None:
         predictor = LLMPredictor(
-            PredictorConfig(model_id=model_id or DEFAULT_MODEL_ID, device=device)
+            PredictorConfig(
+                model_id=model_id or DEFAULT_MODEL_ID, device=device, dtype=dtype
+            )
         )
     raw = text.encode("utf-8")
     t0 = time.perf_counter()
@@ -145,11 +148,12 @@ def run_benchmark(
     *,
     model_id: str | None = None,
     device: str | None = None,
+    dtype: str | None = None,
     precision: int = DEFAULT_PRECISION,
 ) -> list[AlgorithmResult]:
     """运行完整对比（太极压缩 + 传统算法），返回结果列表（太极在前）。"""
     taichi = benchmark_taichi(
-        text, predictor, model_id=model_id, device=device, precision=precision
+        text, predictor, model_id=model_id, device=device, dtype=dtype, precision=precision
     )
     return [taichi] + benchmark_classic(text.encode("utf-8"))
 
@@ -278,6 +282,7 @@ def evaluate_corpus_taichi(
     *,
     model_id: str | None = None,
     device: str | None = None,
+    dtype: str | None = None,
     precision: int = DEFAULT_PRECISION,
     progress: Callable[[int, int, int, int], None] | None = None,
 ) -> AlgorithmResult:
@@ -285,8 +290,8 @@ def evaluate_corpus_taichi(
 
     Args:
         blocks: 采样文本块
-        predictor: 已加载的 LLMPredictor；None 时按 model_id / device 现场加载
-        model_id / device: 仅在 predictor 为 None 时生效
+        predictor: 已加载的 LLMPredictor；None 时按 model_id / device / dtype 现场加载
+        model_id / device / dtype: 仅在 predictor 为 None 时生效
         precision: CDF 量子精度
         progress: 进度回调 progress(done, total, 原始字节, 压缩字节)
     """
@@ -296,7 +301,9 @@ def evaluate_corpus_taichi(
 
     if predictor is None:
         predictor = LLMPredictor(
-            PredictorConfig(model_id=model_id or DEFAULT_MODEL_ID, device=device)
+            PredictorConfig(
+                model_id=model_id or DEFAULT_MODEL_ID, device=device, dtype=dtype
+            )
         )
     total_original = 0
     total_compressed = 0
@@ -334,6 +341,7 @@ def evaluate_corpus(
     *,
     model_id: str | None = None,
     device: str | None = None,
+    dtype: str | None = None,
     precision: int = DEFAULT_PRECISION,
     progress: Callable[[int, int, int, int], None] | None = None,
     include_taichi: bool = True,
@@ -350,6 +358,7 @@ def evaluate_corpus(
                 predictor,
                 model_id=model_id,
                 device=device,
+                dtype=dtype,
                 precision=precision,
                 progress=progress,
             )

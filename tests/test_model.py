@@ -12,9 +12,15 @@ import os
 import unittest
 
 import numpy as np
+import torch
 
 try:
-    from taichi_compress.model import LLMPredictor, PredictorConfig, quantized_softmax
+    from taichi_compress.model import (
+        LLMPredictor,
+        PredictorConfig,
+        quantized_softmax,
+        resolve_dtype,
+    )
     HAVE_LLM = True
 except ImportError:  # pragma: no cover
     HAVE_LLM = False
@@ -61,6 +67,26 @@ class TestQuantizedSoftmax(unittest.TestCase):
             quantized_softmax(np.array([1.0]), scale=-1)
 
 
+class TestResolveDtype(unittest.TestCase):
+    """权重精度解析（纯逻辑，不需要模型权重）。"""
+
+    def test_auto_by_device(self):
+        self.assertEqual(resolve_dtype(None, "cpu"), "float32")
+        self.assertEqual(resolve_dtype(None, "mps"), "float16")
+        self.assertEqual(resolve_dtype(None, "cuda"), "float16")
+        self.assertEqual(resolve_dtype(None, torch.device("cuda:0")), "float16")
+
+    def test_explicit_overrides_auto(self):
+        self.assertEqual(resolve_dtype("float16", "cpu"), "float16")
+        self.assertEqual(resolve_dtype("float32", "mps"), "float32")
+
+    def test_invalid_raises(self):
+        for bad in ("fp16", "half", "bfloat16", ""):
+            with self.subTest(dtype=bad):
+                with self.assertRaises(ValueError):
+                    resolve_dtype(bad, "cpu")
+
+
 @unittest.skipUnless(HAVE_LLM, "需要 torch/transformers")
 class TestLLMPredictor(unittest.TestCase):
     @classmethod
@@ -76,6 +102,12 @@ class TestLLMPredictor(unittest.TestCase):
 
     def setUp(self):
         self.predictor.reset()
+
+    def test_default_dtype_follows_device(self):
+        # 权重精度自动策略：CPU 用 float32，加速器（mps/cuda）用 float16
+        expected = "float32" if self.predictor.device == "cpu" else "float16"
+        self.assertEqual(self.predictor.dtype_name, expected)
+        self.assertEqual(self.predictor._model.dtype, getattr(torch, expected))
 
     def test_distribution_shape_and_normalized(self):
         probs = self.predictor.predict_next_token_probabilities([])
@@ -98,7 +130,14 @@ class TestLLMPredictor(unittest.TestCase):
         self.assertTrue(np.array_equal(a, c))
 
     def test_incremental_matches_full_context(self):
-        """KV Cache 增量预测必须与整段重算一致（任务 2 核心正确性测试）。"""
+        """KV Cache 增量预测必须与整段重算一致（任务 2 核心正确性测试）。
+
+        压缩/解压依赖的是"对称调用序列 → 逐比特一致"；本测试验证的是更强的
+        API 契约（任意时刻可整段重算）。float32 下差异仅 ~1 量子；float16
+        的 ulp 更粗（logit 量级 ~10 时约 0.01），不同前向形状的差异相应放大，
+        容差按精度放宽。
+        """
+        atol = 1e-3 if self.predictor.dtype_name == "float32" else 5e-2
         incremental = []
         for i in range(1, len(self.tokens) + 1):
             incremental.append(self.predictor.predict_next_token_probabilities(self.tokens[:i]))
@@ -107,8 +146,7 @@ class TestLLMPredictor(unittest.TestCase):
                 self.predictor.reset()
                 p_full = self.predictor.predict_next_token_probabilities(self.tokens[:i])
                 self.assertEqual(int(np.argmax(p_inc)), int(np.argmax(p_full)))
-                # 分块方式不同会有 ~1 量子级浮点差，分布应几乎一致
-                self.assertTrue(np.allclose(p_inc, p_full, atol=1e-3))
+                self.assertTrue(np.allclose(p_inc, p_full, atol=atol))
 
     def test_empty_context_then_growth_matches_direct(self):
         # "先 predict([]) 再 predict([t])" 与直接 predict([t]) 分块一致 → 逐比特相同

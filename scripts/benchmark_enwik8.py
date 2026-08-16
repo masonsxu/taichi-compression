@@ -88,6 +88,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--block-chars", type=int, default=8192, help="每块字符数（默认 8192）")
     parser.add_argument("--model", default=DEFAULT_MODEL_ID, help="HuggingFace 模型标识")
     parser.add_argument("--device", default=None, help="cpu / cuda / mps（默认自动）")
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float32", "float16"],
+        default="auto",
+        help="权重精度（默认 auto：mps/cuda 用 float16，cpu 用 float32）",
+    )
     parser.add_argument("--precision", type=int, default=DEFAULT_PRECISION, help="CDF 精度")
     parser.add_argument("--classic-only", action="store_true", help="只跑传统算法（不加载模型）")
     parser.add_argument(
@@ -109,14 +115,22 @@ def main(argv: list[str] | None = None) -> int:
     device = None
     if not args.classic_only:
         print(f"加载模型 {args.model} ...")
-        predictor = LLMPredictor(PredictorConfig(model_id=args.model, device=args.device))
+        predictor = LLMPredictor(
+            PredictorConfig(
+                model_id=args.model,
+                device=args.device,
+                dtype=None if args.dtype == "auto" else args.dtype,
+            )
+        )
         device = predictor.device
-        print(f"设备: {device}\n")
+        dtype_used = predictor.dtype_name
+        print(f"设备: {device}，权重精度: {dtype_used}\n")
         results = evaluate_corpus(
             blocks, predictor, precision=args.precision, progress=_block_progress
         )
     else:
         print("（--classic-only：跳过 taichi）\n")
+        dtype_used = None
         results = evaluate_corpus(blocks, include_taichi=False)
 
     print(format_benchmark_table(results))
@@ -130,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": {
             "model": None if args.classic_only else args.model,
             "device": device,
+            "dtype": dtype_used,
             "precision": args.precision,
             "num_blocks": len(blocks),
             "block_chars": args.block_chars,

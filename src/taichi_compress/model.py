@@ -8,9 +8,13 @@
 
 1. **KV Cache 增量推理**：上下文每增长若干 token，只前向新增部分，
    单步 O(1) 而非整段重算 O(n)；
-2. **数值确定性**：float32 权重、关闭 TF32、logit 量化（默认
-   ``round(x * 1000) / 1000``）、float64 softmax —— 把跨设备/跨内核的
-   浮点差异吸收进量化网格（参考 Hybrid-LLM 的做法）；
+2. **数值确定性**：logit 量化（默认 ``round(x * 1000) / 1000``）+
+   float64 softmax，把浮点差异吸收进量化网格。权重精度可配置：
+   ``float32`` 时跨设备/跨内核差异仅 ~1e-6，量化网格完全吸收，
+   **跨设备解压受支持**；``float16`` 时权重带宽减半（约 1.8x 提速、
+   权重内存减半），但浮点差异超出网格吸收能力，仅保证**同设备**
+   逐比特一致（对称调用序列 + 确定性内核），跨设备解压会被 CRC32
+   拒绝而非解出错误数据。dtype 随容器头记录，解压侧据此加载；
 3. **分布覆盖全词表且恒为正**：概率被 CDF 量化为 0 的 token 依然可编码
    （``arithmetic.build_cdf`` 为每个符号保底 1 个量子）。
 
@@ -36,9 +40,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .tokenizer import Tokenizer
 
-__all__ = ["DEFAULT_MODEL_ID", "PredictorConfig", "LLMPredictor", "quantized_softmax"]
+__all__ = [
+    "DEFAULT_MODEL_ID",
+    "PredictorConfig",
+    "LLMPredictor",
+    "quantized_softmax",
+    "resolve_dtype",
+]
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-0.5B"
+
+_DTYPE_NAMES = ("float32", "float16")
 
 
 @dataclass(frozen=True)
@@ -51,12 +63,15 @@ class PredictorConfig:
         logit_scale: logit 量化精度（量化到 1/scale 的整数格点），
             None 表示不量化（不推荐用于压缩）
         prefill_chunk: 首次填充与长上下文重算时的分块 token 数，控制峰值内存
+        dtype: 权重精度 "float32" / "float16"；None 表示按设备自动选择
+            （cuda/mps 用 float16 换带宽与内存，cpu 用 float32 保兼容）
     """
 
     model_id: str = DEFAULT_MODEL_ID
     device: str | None = None
     logit_scale: int | None = 1000
     prefill_chunk: int = 1024
+    dtype: str | None = None
 
 
 def quantized_softmax(logits: np.ndarray, scale: int | None = 1000) -> np.ndarray:
@@ -92,6 +107,20 @@ def _auto_device() -> str:
     return "cpu"
 
 
+def resolve_dtype(dtype: str | None, device: torch.device | str) -> str:
+    """解析权重精度：None 时按设备自动选择（cuda/mps 用 float16，cpu 用 float32）。
+
+    float16 只保证同设备逐比特一致（见模块 docstring），因此仅在有加速器时
+    作为默认值；显式指定始终优先于自动选择。
+    """
+    if dtype is None:
+        kind = torch.device(device).type
+        return "float16" if kind in ("cuda", "mps") else "float32"
+    if dtype not in _DTYPE_NAMES:
+        raise ValueError(f"dtype 必须为 {'/'.join(_DTYPE_NAMES)} 或 None（自动），当前为 {dtype!r}")
+    return dtype
+
+
 class LLMPredictor:
     """带 KV Cache 的因果 LLM 下一 token 概率预测器。"""
 
@@ -115,14 +144,16 @@ class LLMPredictor:
 
         self._config = cfg
         self._device = torch.device(cfg.device if cfg.device else _auto_device())
+        self._dtype_name = resolve_dtype(cfg.dtype, self._device)
+        torch_dtype = getattr(torch, self._dtype_name)
         self._tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
         try:
-            model = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=torch.float32)
+            model = AutoModelForCausalLM.from_pretrained(cfg.model_id, dtype=torch_dtype)
         except TypeError:  # 兼容旧版 transformers（参数名 torch_dtype）
-            model = AutoModelForCausalLM.from_pretrained(cfg.model_id, torch_dtype=torch.float32)
+            model = AutoModelForCausalLM.from_pretrained(cfg.model_id, torch_dtype=torch_dtype)
         self._model = model.to(self._device)
-        if self._model.dtype != torch.float32:  # 防止 dtype 参数被静默忽略
-            self._model = self._model.float()
+        if self._model.dtype != torch_dtype:  # 防止 dtype 参数被静默忽略
+            self._model = self._model.to(torch_dtype)
         self._model.eval()
 
         # 引导 token：BOS → EOS → 0 逐级回退
@@ -163,6 +194,11 @@ class LLMPredictor:
     def logit_scale(self) -> int | None:
         """logit 量化精度（None 表示不量化）；写入容器头供解压侧校验。"""
         return self._config.logit_scale
+
+    @property
+    def dtype_name(self) -> str:
+        """权重精度（"float32" / "float16"）；写入容器头，解压侧据此加载。"""
+        return self._dtype_name
 
     @property
     def max_context_tokens(self) -> int:

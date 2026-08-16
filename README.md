@@ -65,8 +65,9 @@ TAICHI_TEST_DEVICE=mps uv run pytest tests/test_model.py
   - 确定性保证：`build_cdf` 纯整数运算，numpy 与纯 Python 路径逐位一致
 - ✅ **任务 2：LLM 预测器**（`model.py` + `tokenizer.py`，默认 Qwen2.5-0.5B）
   - KV Cache 增量推理：上下文逐 token 增长时单步 O(1)，与整段重算结果一致（已验证）
-  - 数值确定性：float32 + 关闭 TF32 + logit 量化（`round(x*1000)/1000`）+ float64
-    softmax；实测 MPS 与 CPU 概率差仅 ~1e-6
+  - 数值确定性：logit 量化（`round(x*1000)/1000`）+ float64 softmax；
+    float32 权重实测 MPS 与 CPU 概率差仅 ~1e-6，被量化网格完全吸收
+    （跨设备解压受支持）；fp16 权重仅保证同设备逐比特一致（见下）
   - tokenizer 严格往返（中英文/emoji/空白符），encode 不掺入特殊 token，
     BOS 引导由预测器内部对称处理
 - ✅ **任务 3/4：压缩器与解压器**（`compressor.py` + `decompressor.py`）
@@ -75,42 +76,53 @@ TAICHI_TEST_DEVICE=mps uv run pytest tests/test_model.py
     CRC32 兜底校验（模型/配置不匹配或比特流损坏时拒绝输出而非吐出错误数据）
   - 预测器自动 reset，单实例可交错处理多个文件；超上下文长度给出明确报错
   - 实测（Qwen2.5-0.5B / MPS，examples/sample.txt 636B）：
-    **1.472 bpb，gzip -9 的 28% 体积**；比特流距理论熵下界 < 12 bit
+    **1.472 bpb（float32）/ 1.484 bpb（fp16）**，gzip -9 的 28% 体积；
+    比特流距理论熵下界 < 12 bit
 - ✅ **任务 5：CLI**（`cli.py` + `benchmark.py`，安装后即 `taichi-compress` 命令）
   - `-c/-d/--benchmark/--info` 四种模式互斥；`--model/--device/--precision` 可调
   - `--info` 不加载模型即可查看容器头；解压按容器头自动恢复模型与量化配置
   - `--benchmark` 输出与 gzip -9 / xz -9 / zstd -19 的对比表（CJK 对齐）
-  - 实测（sample.txt 636B / MPS）：taichi **1.472 bpb** vs gzip 5.107 /
-    xz 5.786 / zstd 5.119 bpb
+  - 实测（sample.txt 636B / MPS）：taichi **1.472 bpb（float32）** vs
+    gzip 5.107 / xz 5.786 / zstd 5.119 bpb
 - ✅ **任务 6：enwik8 基准测试**（`scripts/benchmark_enwik8.py`，自动下载语料）
   - 全文等分段采样 8 × 8192 字符，各算法逐块独立压缩、同口径公平对比
   - **taichi 0.946 bpb（8.46x）**，达到 Phase 1 冲刺目标（<1.0 bpb），
     体积为 gzip -9 / xz -9 / zstd -19 的 **27~28%**（3.7 倍压缩率优势）
   - 全部往返校验通过；JSON 报告落盘 `.benchmarks/enwik8_results.json`
 
-## enwik8 基准结果（Qwen2.5-0.5B / MPS，2026-08）
+## enwik8 基准结果（Qwen2.5-0.5B / MPS / float16，2026-08）
 
 | 算法 | 压缩比 | bpb | 压缩速度 | 解压速度 |
 |------|-------:|--------:|---------:|---------:|
-| **taichi** | **8.46x** | **0.946** | 53 B/s | 49 B/s |
-| gzip -9 | 2.25x | 3.560 | 5.56 MB/s | 10.75 MB/s |
-| xz -9 | 2.27x | 3.520 | 1.34 MB/s | 4.84 MB/s |
-| zstd -19 | 2.30x | 3.481 | 2.16 MB/s | 228 MB/s |
+| **taichi (fp16)** | **8.45x** | **0.947** | 147 B/s | 148 B/s |
+| taichi (fp32 基线) | 8.46x | 0.946 | 50 B/s | 48 B/s |
+| gzip -9 | 2.25x | 3.560 | 55 MB/s | 413 MB/s |
+| xz -9 | 2.27x | 3.520 | 4.0 MB/s | 55 MB/s |
+| zstd -19 | 2.30x | 3.481 | 2.9 MB/s | 188 MB/s |
 
 - 采样：enwik8（99.6M 字符）全文等分 8 段各取开头 8192 字符（64 KB，占语料 0.07%），
-  各算法逐块独立压缩-解压并逐字节校验；峰值内存 3.7 GiB（含模型权重）
-- 复现：`uv run python scripts/benchmark_enwik8.py`（约 30 分钟；
-  `--classic-only` 可先快速查看传统算法基线，支持 `--blocks/--block-chars/--model/--device`）
-- 逐块 bpb 区间 0.720 ~ 1.079：纯英文段落低至 0.72，多语言/重标记块偏高
+  各算法逐块独立压缩-解压并逐字节校验；峰值内存 2822 MiB（float32 基线 3772 MiB）
+- 复现：`uv run python scripts/benchmark_enwik8.py`（默认 auto → MPS float16，
+  约 15 分钟；`--dtype float32` 复现基线约 40 分钟；支持 `--blocks/--block-chars/--model/--device`）
+- 逐块 bpb 区间 0.721 ~ 1.080：纯英文段落低至 0.72，多语言/重标记块偏高
+- ✅ **Phase 2 优化：FP16 权重推理**（容器 v2 记录 dtype）
+  - 权重精度可配置（`--dtype auto|float32|float16`，auto = 加速器用 float16、
+    CPU 用 float32）；fp16 权重带宽减半，实测压缩/解压提速 **~2.8x**
+    （50 → 147 B/s），峰值内存 3772 → **2822 MiB**，bpb 仅 +0.001
+  - 容器 v2 在 v1 基础上新增 dtype 字段；float32 输出与 v1 历史文件
+    **逐字节兼容**，旧文件可正常解压
+  - 一致性边界：fp16 仅保证**同设备**逐比特一致（对称调用序列 + 确定性内核），
+    跨设备解压会被 CRC32 拒绝而非解出错误数据；跨设备需求请用 float32 压缩
 
 ## 命令行用法（任务 5）
 
 ```bash
-taichi-compress -c input.txt -o output.tc       # 压缩
-taichi-compress -d output.tc -o restored.txt    # 解压（CRC32 校验）
+taichi-compress -c input.txt -o output.tc       # 压缩（加速器默认 fp16）
+taichi-compress -d output.tc -o restored.txt    # 解压（CRC32 校验，dtype 以容器头为准）
 taichi-compress --benchmark input.txt           # 与 gzip/xz/zstd 对比
 taichi-compress --info output.tc                # 查看容器头（不加载模型）
 taichi-compress -c big.txt --device mps --model Qwen/Qwen2.5-0.5B
+taichi-compress -c doc.txt --dtype float32      # 需要跨设备解压时用 float32
 ```
 
 ## 便捷 API 示例
